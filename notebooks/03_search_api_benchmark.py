@@ -15,6 +15,7 @@
 
 # %%
 import _setup  # noqa: F401
+import atexit
 import statistics
 import subprocess
 import time
@@ -34,10 +35,13 @@ proc = subprocess.Popen(
     ["uvicorn", "app.main:app", "--port", "8000", "--log-level", "warning"],
     cwd=str(ROOT),
 )
+atexit.register(lambda: proc.poll() is None and proc.terminate())
 
 # Đợi server up + warm (Searcher.from_corpus loads embeddings + indexes 1000 docs)
 URL = "http://localhost:8000"
-for _ in range(60):
+# Indexing 1,000 documents is hardware-dependent: it is quick on a native
+# workstation but can take several minutes on a CPU-limited WSL instance.
+for _ in range(1800):
     try:
         r = httpx.get(f"{URL}/healthz", timeout=2.0)
         if r.status_code == 200 and r.json().get("ready"):
@@ -46,7 +50,7 @@ for _ in range(60):
         pass
     time.sleep(1)
 else:
-    raise RuntimeError("API didn't become ready within 60s")
+    raise RuntimeError("API didn't become ready within 30 minutes")
 
 print(httpx.get(f"{URL}/healthz").json())
 
@@ -63,7 +67,7 @@ for h in body["hits"][:3]:
     print(f"  {h['doc_id']:>14}  score={h['score']:.4f}  {h['title']}")
 
 # %% [markdown]
-# ## 3. TODO — Latency benchmark (100 queries × 3 modes)
+# ## 3. Latency benchmark (100 queries × 3 modes)
 #
 # Dùng 50 golden queries × 2 reps = 100 calls/mode. Ghi nhận latency từ
 # `body["latency_ms"]` (server-side, đã trừ network) HOẶC từ wall-clock httpx
@@ -88,12 +92,16 @@ def percentile(values: list[float], p: float) -> float:
 def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
     server_latencies: list[float] = []
     wall_latencies: list[float] = []
-    for _ in range(reps):
-        for q in golden:
-            t0 = time.perf_counter()
-            r = httpx.get(f"{URL}/search", params={"q": q["query"], "mode": mode})
-            wall_latencies.append((time.perf_counter() - t0) * 1000)
-            server_latencies.append(r.json()["latency_ms"])
+    # Reuse one HTTP connection so wall-clock numbers measure the API rather
+    # than TCP connection setup. The rubric threshold still uses server time.
+    with httpx.Client(base_url=URL, timeout=30.0) as client:
+        for _ in range(reps):
+            for q in golden:
+                t0 = time.perf_counter()
+                r = client.get("/search", params={"q": q["query"], "mode": mode})
+                wall_latencies.append((time.perf_counter() - t0) * 1000)
+                r.raise_for_status()
+                server_latencies.append(r.json()["latency_ms"])
     return {
         "p50_server": percentile(server_latencies, 0.50),
         "p95_server": percentile(server_latencies, 0.95),
